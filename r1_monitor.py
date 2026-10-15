@@ -21,7 +21,7 @@ BUDGET_B = 15_000_000            # 최대 예산 (1,500만)
 NOTIFY_UNKNOWN_YEAR = False      # True: 연식 안 적힌 매물도 '연식 미확인'으로 알림
 PASSO_ENABLED = True             # False: 파쏘 감시 끄기
 PASSO_LIST_URL = "http://bike.passo.co.kr/bike/"
-LIGHTWAGEN_SEARCH_URL = "https://www.reitwagen.co.kr/products/home/used?u=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&s=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&b=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&p=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&e=keyword%255B0%255D%3DYZF%2520R1"       # 라이트바겐 웹에서 R1 검색한 결과 페이지 주소를 따옴표 안에 붙여넣기
+LIGHTWAGEN_SEARCH_URL = "https://www.reitwagen.co.kr/products/home/used?u=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&s=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&b=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&p=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&e=keyword%255B0%255D%3DYZF%2520R1"
 # ═══════════════════════════════════════════════════════════════
 
 REAL_MIN, REAL_MAX = 5_000_000, 30_000_000      # R1 실제 시세로 인정하는 범위
@@ -184,7 +184,7 @@ class Fetcher:
         r.raise_for_status()
         return r.json()
 
-    def html(self, url):
+    def html(self, url, wait=3000, timeout=30_000):
         if self._ctx is None:
             from playwright.sync_api import sync_playwright
             self._pw = sync_playwright().start()
@@ -192,8 +192,13 @@ class Fetcher:
             self._ctx = self._browser.new_context(user_agent=UA, locale="ko-KR", timezone_id="Asia/Seoul")
         page = self._ctx.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-            page.wait_for_timeout(3000)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            page.wait_for_timeout(wait)
+            try:   # 아래로 스크롤해서 늦게 뜨는 매물까지 불러오기
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
             return page.content()
         finally:
             page.close()
@@ -275,22 +280,32 @@ def page_detail(f, l: Listing):
 
 # ───────────── 플랫폼별 검색 ─────────────
 def bunjang_search(f, kw):
-    data = f.json(f"https://api.bunjang.co.kr/api/1/find_v2.json?q={quote(kw)}&order=date&page=0&n=60")
-    out = []
-    for it in data.get("list", []):
-        pid = str(it.get("pid") or "")
-        if pid:
-            ts = to_int(it.get("update_time"))
-            out.append(Listing("번개장터", pid, it.get("name", ""), f"https://m.bunjang.co.kr/products/{pid}",
-                               to_int(it.get("price")),
-                               posted_at=datetime.fromtimestamp(ts, KST).strftime("%m/%d %H:%M") if ts else ""))
-    return out
+    """번개장터 웹 검색 화면을 열어서 매물 카드 읽기"""
+    base = "https://m.bunjang.co.kr"
+    soup = BeautifulSoup(f.html(f"{base}/search/products?q={quote(kw)}&order=date", wait=4000), "lxml")
+    out = {}
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/products/(\d+)", a["href"])
+        if not m or m.group(1) in out:
+            continue
+        parts = [s.strip() for s in a.stripped_strings if s.strip()]
+        if not parts:
+            continue
+        price = next((to_int(s) for s in parts if re.fullmatch(r"[\d,]+", s)), None)
+        texts = [s for s in parts if not re.fullmatch(r"[\d,]+", s) and s not in ("AD", "광고")]
+        if not texts:
+            continue
+        title = next((s for s in texts if R1_RE.search(s)), texts[0])
+        out[m.group(1)] = Listing("번개장터", m.group(1), title, f"{base}/products/{m.group(1)}", price)
+    return list(out.values())
 
 
 def bunjang_detail(f, l):
     try:
         data = f.json(f"https://api.bunjang.co.kr/api/pms/v3/products-detail/{l.item_id}?viewerUid=-1")
         l.content = ((data.get("data") or {}).get("product") or {}).get("description", "")[:5000]
+        if not l.content:
+            raise ValueError("empty")
     except Exception:
         page_detail(f, l)
 
@@ -325,14 +340,14 @@ def daangn_search(f, kw):
     return list(out.values()) or links_with_pattern(soup, "당근마켓", base, r"/buy-sell/([^/?#]+)")
 
 
-def site_search(f, name, tpl, kw):
+def site_search(f, name, tpl, kw, wait=5000, timeout=30_000):
     """주소만 알면 되는 범용 검색: 페이지에서 제목에 R1이 들어간 링크를 골라냄"""
     if not tpl:
         return None
     if "{kw}" not in tpl and kw != KEYWORDS[0]:
         return []          # 검색어 없는 목록 페이지는 한 번만 열기
     url = tpl.replace("{kw}", quote(kw))
-    soup = BeautifulSoup(f.html(url), "lxml")
+    soup = BeautifulSoup(f.html(url, wait=wait, timeout=timeout), "lxml")
     host, out = urlparse(url).netloc, []
     for a in soup.find_all("a", href=True):
         full, text = urljoin(url, a["href"]), a.get_text(" ", strip=True)
@@ -346,7 +361,7 @@ def site_search(f, name, tpl, kw):
 def passo_search(f, kw):
     if not PASSO_ENABLED:
         return None
-    return site_search(f, "파쏘", PASSO_LIST_URL, kw)
+    return site_search(f, "파쏘", PASSO_LIST_URL, kw, wait=3000, timeout=60_000)
 
 
 def lightwagen_search(f, kw):
