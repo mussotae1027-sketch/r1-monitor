@@ -13,13 +13,18 @@ from urllib.parse import quote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# ───────────── 조건 (여기만 바꾸면 됨) ─────────────
+# ═══════════════════ 설정 (여기만 바꾸면 됨) ═══════════════════
 KEYWORDS = ["야마하 R1", "YZF-R1"]
 YEAR_MIN, YEAR_MAX = 2015, 2019
-BUDGET_A, BUDGET_B = 10_000_000, 15_000_000
-NOTIFY_UNKNOWN_YEAR = False      # True로 바꾸면 연식이 안 적힌 매물도 '연식 미확인'으로 알림
-REAL_MIN, REAL_MAX = 5_000_000, 30_000_000      # R1 실제 시세로 인정하는 범위
+BUDGET_A = 10_000_000            # 🔥 표시 기준 (1,000만)
+BUDGET_B = 15_000_000            # 최대 예산 (1,500만)
+NOTIFY_UNKNOWN_YEAR = False      # True: 연식 안 적힌 매물도 '연식 미확인'으로 알림
+PASSO_ENABLED = True             # False: 파쏘 감시 끄기
+PASSO_LIST_URL = "http://bike.passo.co.kr/bike/"
+LIGHTWAGEN_SEARCH_URL = ""       # 라이트바겐 웹에서 R1 검색한 결과 페이지 주소를 따옴표 안에 붙여넣기
+# ═══════════════════════════════════════════════════════════════
 
+REAL_MIN, REAL_MAX = 5_000_000, 30_000_000      # R1 실제 시세로 인정하는 범위
 SEEN_FILE = "seen.json"
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 KST = timezone(timedelta(hours=9))
@@ -321,16 +326,31 @@ def daangn_search(f, kw):
 
 
 def site_search(f, name, tpl, kw):
+    """주소만 알면 되는 범용 검색: 페이지에서 제목에 R1이 들어간 링크를 골라냄"""
     if not tpl:
         return None
+    if "{kw}" not in tpl and kw != KEYWORDS[0]:
+        return []          # 검색어 없는 목록 페이지는 한 번만 열기
     url = tpl.replace("{kw}", quote(kw))
     soup = BeautifulSoup(f.html(url), "lxml")
     host, out = urlparse(url).netloc, []
     for a in soup.find_all("a", href=True):
         full, text = urljoin(url, a["href"]), a.get_text(" ", strip=True)
         if urlparse(full).netloc == host and full != url and text and R1_RE.search(text):
-            out.append(Listing(name, urlparse(full).path, text[:120], full))
+            p = urlparse(full)
+            out.append(Listing(name, p.path + ("?" + p.query if p.query else ""), text[:120], full,
+                               text_price(text)))
     return out
+
+
+def passo_search(f, kw):
+    if not PASSO_ENABLED:
+        return None
+    return site_search(f, "파쏘", PASSO_LIST_URL, kw)
+
+
+def lightwagen_search(f, kw):
+    return site_search(f, "라이트바겐", LIGHTWAGEN_SEARCH_URL or os.getenv("LIGHTWAGEN_SEARCH_URL", ""), kw)
 
 
 def batume_search(f, kw):
@@ -356,13 +376,13 @@ PLATFORMS = [
     ("번개장터", bunjang_search, bunjang_detail),
     ("중고나라", joongna_search, page_detail),
     ("당근마켓", daangn_search, page_detail),
-    ("라이트바겐", lambda f, kw: site_search(f, "라이트바겐", os.getenv("LIGHTWAGEN_SEARCH_URL", ""), kw), page_detail),
-    ("파쏘", lambda f, kw: site_search(f, "파쏘", os.getenv("PASSO_SEARCH_URL", ""), kw), page_detail),
+    ("라이트바겐", lightwagen_search, page_detail),
+    ("파쏘", passo_search, page_detail),
     ("바튜매", batume_search, None),
 ]
 
 
-# ───────────── 디스코드 ─────────────
+# ───────────── 디스코드 (한 번에 모아서 보내기) ─────────────
 def discord(payload):
     for _ in range(3):
         r = requests.post(WEBHOOK, json=payload, timeout=15)
@@ -375,31 +395,50 @@ def discord(payload):
     return False
 
 
-TIER = {"A": "🔥 1,000만 이하", "B": "1,500만 이하", "?": "가격 직접 확인"}
+def clean(s, n=70):
+    s = re.sub(r"\s+", " ", s or "").strip().replace("[", "(").replace("]", ")")
+    return s[:n] + ("…" if len(s) > n else "")
 
 
-def send_alert(l: Listing, res, extra_note=""):
-    notes = ([extra_note] if extra_note else []) + res["notes"]
-    embed = {
-        "title": l.title[:250], "url": l.url,
-        "color": 0xE5484D if res["tier"] == "A" else 0x3E63DD,
-        "description": ("".join(f"⚠️ {n}\n" for n in notes) + "\n" + l.content[:300]).strip() or "-",
-        "fields": [
-            {"name": "가격", "value": won(res["price"]) if res["price"] else "미확인", "inline": True},
-            {"name": "연식", "value": f"{res['year']}년식" if res["year"] else "미확인", "inline": True},
-            {"name": "플랫폼", "value": l.platform, "inline": True},
-            {"name": "조건", "value": TIER[res["tier"]], "inline": True},
-        ],
-        "footer": {"text": f"작성 {l.posted_at}" if l.posted_at else "R1 매물 알림"},
-    }
-    payload = {"embeds": [embed]}
-    if res["tier"] == "A":
-        payload["content"] = "@here 1천 이하 R1 떴다"
-    try:
-        return discord(payload)
-    except Exception as e:
-        print("디스코드 발송 실패:", e)
-        return False
+def format_item(l, res, note):
+    icon = {"A": "🔥", "B": "🔵"}.get(res["tier"], "❔")
+    price = won(res["price"]) if res["price"] else "가격 미확인"
+    year = f"{res['year']}년식" if res["year"] else "연식 미확인"
+    lines = [f"{icon} **{price}** · {year} · {l.platform}", f"[{clean(l.title)}]({l.url})"]
+    notes = ([note] if note else []) + [n for n in res["notes"] if n != "연식 미확인"]
+    if notes:
+        lines.append("⚠️ " + " / ".join(notes))
+    return "\n".join(lines)
+
+
+def send_digest(items):
+    """찾은 매물을 메시지 하나로 모아서 발송 (1천 이하 → 가격 낮은 순)"""
+    order = {"A": 0, "B": 1, "?": 2}
+    items.sort(key=lambda x: (order[x[1]["tier"]], x[1]["price"] or 10**10))
+    chunks, cur = [], ""
+    for l, res, note in items:
+        block = format_item(l, res, note)
+        if cur and len(cur) + len(block) > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += ("\n\n" if cur else "") + block
+    if cur:
+        chunks.append(cur)
+
+    n_a = sum(1 for _, r, _ in items if r["tier"] == "A")
+    ok = True
+    for i, chunk in enumerate(chunks):
+        title = f"🏍️ R1 새 매물 {len(items)}건" + (f" ({i + 1}/{len(chunks)})" if len(chunks) > 1 else "")
+        payload = {"embeds": [{"title": title, "description": chunk,
+                               "color": 0xE5484D if n_a else 0x3E63DD}]}
+        if i == 0 and n_a:
+            payload["content"] = f"@here 🔥 1천 이하 {n_a}건 포함"
+        try:
+            ok = discord(payload) and ok
+        except Exception as e:
+            print("디스코드 발송 실패:", e)
+            ok = False
+    return ok
 
 
 # ───────────── 메인 ─────────────
@@ -422,7 +461,7 @@ def main():
     if not WEBHOOK:
         print("DISCORD_WEBHOOK_URL이 비어 있어요. Settings > Secrets에 등록했는지 확인하세요.")
         sys.exit(1)
-    seen, today, report = load_seen(), datetime.now(KST).strftime("%Y-%m-%d"), []
+    seen, today, report, pending = load_seen(), datetime.now(KST).strftime("%Y-%m-%d"), [], []
     f = Fetcher()
     try:
         for name, search, detail in PLATFORMS:
@@ -442,7 +481,7 @@ def main():
                 report.append(f"⏸️ {name}: 설정 안 됨 (건너뜀)")
                 continue
 
-            r1 = sent = 0
+            r1 = new = 0
             for l in found.values():
                 if not R1_RE.search(l.title) or WANTED_RE.search(l.title) or EXCLUDE_RE.search(l.title):
                     continue
@@ -462,15 +501,20 @@ def main():
                 rp = res["price"] if res else None
                 was_match = bool(old and old.get("m"))
                 cheaper = bool(was_match and rp and old.get("rp") and rp < old["rp"])
+                entry = {"p": l.price, "rp": rp, "m": bool(res), "t": l.title[:60], "at": today}
                 if res and (not was_match or cheaper):
                     note = f"가격 인하 {won(old['rp'])} → {won(rp)}" if cheaper else ""
-                    if not send_alert(l, res, note):
-                        continue
-                    sent += 1
-                seen[l.uid] = {"p": l.price, "rp": rp, "m": bool(res), "t": l.title[:60], "at": today}
+                    pending.append((l, res, note, entry))
+                    new += 1
+                else:
+                    seen[l.uid] = entry
             icon = "⚠️" if (err and not found) else "✅"
-            report.append(f"{icon} {name}: 검색 {len(found)}건 / R1 {r1}건 / 알림 {sent}건"
+            report.append(f"{icon} {name}: 검색 {len(found)}건 / R1 {r1}건 / 새 매물 {new}건"
                           + (f"\n   오류: {err}" if err and not found else ""))
+
+        if pending and send_digest([(l, r, n) for l, r, n, _ in pending]):
+            for l, _, _, entry in pending:
+                seen[l.uid] = entry       # 발송 성공한 것만 '봤음'으로 저장 (실패 시 다음에 재시도)
     finally:
         f.close()
         save_seen(seen)
