@@ -19,6 +19,7 @@ YEAR_MIN, YEAR_MAX = 2015, 2019
 BUDGET_A = 10_000_000            # 🔥 표시 기준 (1,000만)
 BUDGET_B = 15_000_000            # 최대 예산 (1,500만)
 NOTIFY_UNKNOWN_YEAR = False      # True: 연식 안 적힌 매물도 '연식 미확인'으로 알림
+SKIP_RESERVED = True             # True: 예약중 매물도 제외 / False: 예약중은 알림 받기
 PASSO_ENABLED = True             # False: 파쏘 감시 끄기
 PASSO_LIST_URL = "http://bike.passo.co.kr/bike/"
 LIGHTWAGEN_SEARCH_URL = "https://www.reitwagen.co.kr/products/home/used?u=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&s=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&b=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&p=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&e=keyword%255B0%255D%3DYZF%2520R1"
@@ -35,6 +36,10 @@ R1_RE = re.compile(r"(?<![a-z0-9])(?:yzf[\s\-]?)?r\s?1(?:m|s)?(?![0-9a-z\-])|알
 EXCLUDE_RE = re.compile(r"mt\s?-?\s?10|r1\s?-?\s?z", re.I)
 WANTED_RE = re.compile(r"삽니다|구합니다|구매합니다|구해요|매입합니다")
 BIKE_SIGNAL_RE = re.compile(r"[\d만천]\s*(?:km|키로|킬로)|주행|연식|년식|년형|무사고|명의|서류", re.I)
+
+# 판매완료/예약중 판별
+SOLD_TEXT_RE = re.compile(r"판매\s*완료|거래\s*완료|sold\s*out" + (r"|예약\s*중" if SKIP_RESERVED else ""), re.I)
+SOLD_STATUS_RE = re.compile(r"sold|complete|판매\s*완료|거래\s*완료" + (r"|reserv|예약" if SKIP_RESERVED else ""), re.I)
 
 # 연식 패턴
 Y2 = r"(9[89]|[0-2]\d)"
@@ -74,10 +79,20 @@ class Listing:
     price: int | None = None
     content: str = ""
     posted_at: str = ""
+    sold: bool = False
 
     @property
     def uid(self):
         return f"{self.platform}:{self.item_id}"
+
+
+def status_sold(d: dict) -> bool:
+    """JSON 데이터 안의 state/status 값으로 판매완료 여부 확인"""
+    for k, v in d.items():
+        if isinstance(v, (str, int)) and re.search(r"state|status|availability", k, re.I):
+            if SOLD_STATUS_RE.search(str(v)):
+                return True
+    return False
 
 
 # ───────────── 가격/연식 해석 ─────────────
@@ -237,36 +252,48 @@ def ld_products(soup):
                 yield d
 
 
-def offer_price(d):
+def first_offer(d):
     o = d.get("offers") or {}
     if isinstance(o, list):
         o = o[0] if o else {}
-    return to_int(o.get("price")) if isinstance(o, dict) else None
+    return o if isinstance(o, dict) else {}
+
+
+def offer_price(d):
+    return to_int(first_offer(d).get("price"))
+
+
+def offer_sold(d):
+    avail = str(first_offer(d).get("availability", ""))
+    return bool(re.search(r"SoldOut|OutOfStock|Discontinued", avail, re.I))
 
 
 def links_with_pattern(soup, platform, base, pattern):
     rx, out = re.compile(pattern), {}
     for a in soup.find_all("a", href=True):
         m, text = rx.search(a["href"]), a.get_text(" ", strip=True)
-        if m and text:
-            out.setdefault(m.group(1), Listing(platform, m.group(1), text[:120], urljoin(base, a["href"])))
+        if m and text and m.group(1) not in out:
+            out[m.group(1)] = Listing(platform, m.group(1), text[:120], urljoin(base, a["href"]),
+                                      sold=bool(SOLD_TEXT_RE.search(text)))
     return list(out.values())
 
 
 def page_detail(f, l: Listing):
-    """매물 본문만 가져오기 (다른 추천 매물 글이 섞이지 않게 페이지 전체 텍스트는 쓰지 않음)"""
+    """매물 본문 + 판매상태 가져오기 (다른 추천 매물 글이 섞이지 않게 페이지 전체 텍스트는 쓰지 않음)"""
     soup = BeautifulSoup(f.html(l.url), "lxml")
     desc, price = "", None
     for d in ld_products(soup):
         desc = desc or str(d.get("description") or "")
         price = price or offer_price(d)
+        l.sold = l.sold or offer_sold(d)
     nd = soup.find("script", id="__NEXT_DATA__")
-    if not desc and nd and nd.string:
+    if nd and nd.string:
         try:
             for d in walk(json.loads(nd.string)):
                 v = d.get("productDescription")
                 if isinstance(v, str) and v:
-                    desc = v
+                    desc = desc or v
+                    l.sold = l.sold or status_sold(d)
                     break
         except json.JSONDecodeError:
             pass
@@ -296,14 +323,17 @@ def bunjang_search(f, kw):
         if not texts:
             continue
         title = next((s for s in texts if R1_RE.search(s)), texts[0])
-        out[m.group(1)] = Listing("번개장터", m.group(1), title, f"{base}/products/{m.group(1)}", price)
+        out[m.group(1)] = Listing("번개장터", m.group(1), title, f"{base}/products/{m.group(1)}", price,
+                                  sold=bool(SOLD_TEXT_RE.search(" ".join(parts))))
     return list(out.values())
 
 
 def bunjang_detail(f, l):
     try:
         data = f.json(f"https://api.bunjang.co.kr/api/pms/v3/products-detail/{l.item_id}?viewerUid=-1")
-        l.content = ((data.get("data") or {}).get("product") or {}).get("description", "")[:5000]
+        prod = (data.get("data") or {}).get("product") or {}
+        l.content = prod.get("description", "")[:5000]
+        l.sold = l.sold or status_sold(prod)
         if not l.content:
             raise ValueError("empty")
     except Exception:
@@ -321,7 +351,8 @@ def joongna_search(f, kw):
                 seq, title = d.get("seq") or d.get("productSeq"), d.get("title") or d.get("productTitle")
                 if seq and title and ("price" in d or "productPrice" in d):
                     out[str(seq)] = Listing("중고나라", str(seq), str(title), f"{base}/product/{seq}",
-                                            to_int(d.get("price") or d.get("productPrice")))
+                                            to_int(d.get("price") or d.get("productPrice")),
+                                            sold=status_sold(d))
         except json.JSONDecodeError:
             pass
     return list(out.values()) or links_with_pattern(soup, "중고나라", base, r"/product/(\d+)")
@@ -336,8 +367,49 @@ def daangn_search(f, kw):
         m = re.search(r"/buy-sell/([^/?#]+)", url)
         if m:
             out[m.group(1)] = Listing("당근마켓", m.group(1), str(d.get("name", "")), url,
-                                      offer_price(d), str(d.get("description") or ""))
+                                      offer_price(d), str(d.get("description") or ""),
+                                      sold=offer_sold(d))
     return list(out.values()) or links_with_pattern(soup, "당근마켓", base, r"/buy-sell/([^/?#]+)")
+
+
+def reitwagen_search(f, kw):
+    """라이트바겐: R1 필터된 목록 페이지에서 /products/detail/번호 링크 수집"""
+    url = LIGHTWAGEN_SEARCH_URL or os.getenv("LIGHTWAGEN_SEARCH_URL", "")
+    if not url:
+        return None
+    if kw != KEYWORDS[0]:
+        return []          # 목록 페이지는 한 번만 열기
+    base = "https://www.reitwagen.co.kr"
+    html = f.html(url, wait=5000)
+    soup = BeautifulSoup(html, "lxml")
+    out = {}
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/products/detail/(\d+)", a["href"])
+        if not m or m.group(1) in out:
+            continue
+        text = a.get_text(" ", strip=True)
+        title = text[:120] if R1_RE.search(text) else f"야마하 YZF R1 {text[:100]}".strip()
+        out[m.group(1)] = Listing("라이트바겐", m.group(1), title, f"{base}/products/detail/{m.group(1)}",
+                                  text_price(text), sold=bool(SOLD_TEXT_RE.search(text)))
+    if not out:   # 링크 태그가 없으면 페이지 소스에서 매물 번호 직접 찾기
+        for pid in dict.fromkeys(re.findall(r"/products/detail/(\d+)", html)):
+            out[pid] = Listing("라이트바겐", pid, "야마하 YZF R1", f"{base}/products/detail/{pid}")
+    return list(out.values())
+
+
+def reitwagen_detail(f, l):
+    """라이트바겐 매물 페이지: 제목(모델·연식·가격) + 상세 설명 + 판매상태"""
+    soup = BeautifulSoup(f.html(l.url, wait=2500), "lxml")
+    page_title = soup.title.get_text(strip=True).split("|")[0].strip() if soup.title else ""
+    if page_title:
+        l.title = page_title       # 예: 야마하 YZF R1 2022년식 개인중고 2,200만원
+    body = soup.get_text(" ", strip=True)
+    m = re.search(r"상세 정보(.*?)(?:튜닝이력|정비이력|모델 정보)", body)
+    l.content = (m.group(1) if m else "")[:5000]
+    if l.price is None:
+        l.price = text_price(page_title)
+    if SOLD_TEXT_RE.search(page_title) or re.search(r"판매\s*완료|거래\s*완료", body):
+        l.sold = True
 
 
 def site_search(f, name, tpl, kw, wait=5000, timeout=30_000):
@@ -345,7 +417,7 @@ def site_search(f, name, tpl, kw, wait=5000, timeout=30_000):
     if not tpl:
         return None
     if "{kw}" not in tpl and kw != KEYWORDS[0]:
-        return []          # 검색어 없는 목록 페이지는 한 번만 열기
+        return []
     url = tpl.replace("{kw}", quote(kw))
     soup = BeautifulSoup(f.html(url, wait=wait, timeout=timeout), "lxml")
     host, out = urlparse(url).netloc, []
@@ -354,7 +426,7 @@ def site_search(f, name, tpl, kw, wait=5000, timeout=30_000):
         if urlparse(full).netloc == host and full != url and text and R1_RE.search(text):
             p = urlparse(full)
             out.append(Listing(name, p.path + ("?" + p.query if p.query else ""), text[:120], full,
-                               text_price(text)))
+                               text_price(text), sold=bool(SOLD_TEXT_RE.search(text))))
     return out
 
 
@@ -362,10 +434,6 @@ def passo_search(f, kw):
     if not PASSO_ENABLED:
         return None
     return site_search(f, "파쏘", PASSO_LIST_URL, kw, wait=3000, timeout=60_000)
-
-
-def lightwagen_search(f, kw):
-    return site_search(f, "라이트바겐", LIGHTWAGEN_SEARCH_URL or os.getenv("LIGHTWAGEN_SEARCH_URL", ""), kw)
 
 
 def batume_search(f, kw):
@@ -382,8 +450,9 @@ def batume_search(f, kw):
         strip = lambda s: BeautifulSoup(s or "", "lxml").get_text(" ", strip=True)
         link = it.get("link", "")
         m = re.search(r"/(\d+)(?:\?|$)", link)
-        out.append(Listing("바튜매", m.group(1) if m else link, strip(it.get("title")), link,
-                           None, strip(it.get("description"))))
+        title = strip(it.get("title"))
+        out.append(Listing("바튜매", m.group(1) if m else link, title, link,
+                           None, strip(it.get("description")), sold=bool(SOLD_TEXT_RE.search(title))))
     return out
 
 
@@ -391,7 +460,7 @@ PLATFORMS = [
     ("번개장터", bunjang_search, bunjang_detail),
     ("중고나라", joongna_search, page_detail),
     ("당근마켓", daangn_search, page_detail),
-    ("라이트바겐", lightwagen_search, page_detail),
+    ("라이트바겐", reitwagen_search, reitwagen_detail),
     ("파쏘", passo_search, page_detail),
     ("바튜매", batume_search, None),
 ]
@@ -496,11 +565,14 @@ def main():
                 report.append(f"⏸️ {name}: 설정 안 됨 (건너뜀)")
                 continue
 
-            r1 = new = 0
+            r1 = new = sold = 0
             for l in found.values():
                 if not R1_RE.search(l.title) or WANTED_RE.search(l.title) or EXCLUDE_RE.search(l.title):
                     continue
                 r1 += 1
+                if l.sold or SOLD_TEXT_RE.search(l.title):
+                    sold += 1
+                    continue
                 if l.price and REAL_MIN <= l.price <= REAL_MAX and l.price > BUDGET_B:
                     continue
                 old = seen.get(l.uid)
@@ -512,11 +584,16 @@ def main():
                     except Exception:
                         pass
                     nap()
+                entry = {"p": l.price, "rp": None, "m": False, "t": l.title[:60], "at": today}
+                if l.sold or not R1_RE.search(l.title):      # 상세에서 판매완료/R1 아님 확인
+                    sold += int(l.sold)
+                    seen[l.uid] = entry
+                    continue
                 res = evaluate(l)
                 rp = res["price"] if res else None
                 was_match = bool(old and old.get("m"))
                 cheaper = bool(was_match and rp and old.get("rp") and rp < old["rp"])
-                entry = {"p": l.price, "rp": rp, "m": bool(res), "t": l.title[:60], "at": today}
+                entry.update(rp=rp, m=bool(res))
                 if res and (not was_match or cheaper):
                     note = f"가격 인하 {won(old['rp'])} → {won(rp)}" if cheaper else ""
                     pending.append((l, res, note, entry))
@@ -524,7 +601,7 @@ def main():
                 else:
                     seen[l.uid] = entry
             icon = "⚠️" if (err and not found) else "✅"
-            report.append(f"{icon} {name}: 검색 {len(found)}건 / R1 {r1}건 / 새 매물 {new}건"
+            report.append(f"{icon} {name}: 검색 {len(found)}건 / R1 {r1}건 / 판매완료 {sold}건 / 새 매물 {new}건"
                           + (f"\n   오류: {err}" if err and not found else ""))
 
         if pending and send_digest([(l, r, n) for l, r, n, _ in pending]):
