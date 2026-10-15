@@ -21,7 +21,7 @@ BUDGET_B = 15_000_000            # 최대 예산 (1,500만)
 NOTIFY_UNKNOWN_YEAR = False      # True: 연식 안 적힌 매물도 '연식 미확인'으로 알림
 PASSO_ENABLED = True             # False: 파쏘 감시 끄기
 PASSO_LIST_URL = "http://bike.passo.co.kr/bike/"
-LIGHTWAGEN_SEARCH_URL = ""       # 라이트바겐 웹에서 R1 검색한 결과 페이지 주소를 따옴표 안에 붙여넣기
+LIGHTWAGEN_SEARCH_URL = "https://www.reitwagen.co.kr/products/home/used?u=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&s=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&b=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&p=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&e=keyword%255B0%255D%3DYZF%2520R1"       # 라이트바겐 웹에서 R1 검색한 결과 페이지 주소를 따옴표 안에 붙여넣기
 # ═══════════════════════════════════════════════════════════════
 
 REAL_MIN, REAL_MAX = 5_000_000, 30_000_000      # R1 실제 시세로 인정하는 범위
