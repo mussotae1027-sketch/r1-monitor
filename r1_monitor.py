@@ -13,11 +13,13 @@ from urllib.parse import quote, urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-# ───────────── 조건 ─────────────
+# ───────────── 조건 (여기만 바꾸면 됨) ─────────────
 KEYWORDS = ["야마하 R1", "YZF-R1"]
 YEAR_MIN, YEAR_MAX = 2015, 2019
 BUDGET_A, BUDGET_B = 10_000_000, 15_000_000
+NOTIFY_UNKNOWN_YEAR = False      # True로 바꾸면 연식이 안 적힌 매물도 '연식 미확인'으로 알림
 REAL_MIN, REAL_MAX = 5_000_000, 30_000_000      # R1 실제 시세로 인정하는 범위
+
 SEEN_FILE = "seen.json"
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 KST = timezone(timedelta(hours=9))
@@ -28,11 +30,27 @@ R1_RE = re.compile(r"(?<![a-z0-9])(?:yzf[\s\-]?)?r\s?1(?:m|s)?(?![0-9a-z\-])|알
 EXCLUDE_RE = re.compile(r"mt\s?-?\s?10|r1\s?-?\s?z", re.I)
 WANTED_RE = re.compile(r"삽니다|구합니다|구매합니다|구해요|매입합니다")
 BIKE_SIGNAL_RE = re.compile(r"[\d만천]\s*(?:km|키로|킬로)|주행|연식|년식|년형|무사고|명의|서류", re.I)
-YEAR_PATTERNS = [
-    re.compile(r"(?<!\d)(20[0-2]\d|[0-2]\d)\s*년\s*(?:식|형)"),
-    re.compile(r"연식\s*[:：]?\s*(20[0-2]\d|[0-2]\d)(?!\d)"),
-    re.compile(r"(?<![a-z])my\s?(\d{2})(?!\d)", re.I),
+
+# 연식 패턴
+Y2 = r"(9[89]|[0-2]\d)"
+Y4 = r"(199[89]|20[0-2]\d)"
+STRONG_YEAR = [   # 제목·본문 모두에서 사용 (확실한 연식 표기)
+    re.compile(rf"(?<!\d){Y4}\s*년\s*(?:식|형|도|모델)"),
+    re.compile(rf"(?<![\d,.]){Y2}\s*년\s*(?:식|형|도|모델)"),
+    re.compile(rf"(?<![\d,.]){Y4}\s*(?:식|형)(?![가-힣])"),
+    re.compile(rf"(?<![\d,.]){Y2}\s*(?:식|형)(?![가-힣])"),
+    re.compile(rf"연식\s*[:：]?\s*{Y4}"),
+    re.compile(rf"연식\s*[:：]?\s*{Y2}(?!\d)"),
+    re.compile(rf"(?<![a-z])my\s?'?{Y2}(?!\d)", re.I),
+    re.compile(rf"(?<![\d,.]){Y2}\s*년\s*(?:\d{{1,2}}\s*월\s*)?(?:등록|출고|최초)"),
 ]
+TITLE_YEAR = [    # 제목에서만 사용 (느슨한 표기: '2017', '17년', ''17')
+    re.compile(rf"(?<![\d,.]){Y4}(?![\d,.]|\s*(?:만|원|km|cc|키로))", re.I),
+    re.compile(rf"(?<![\d,.]){Y2}\s*년(?!\s*(?:동안|간|째|전|이상|넘|정도|탄|탔))"),
+    re.compile(rf"['’]{Y2}(?!\d)"),
+]
+
+# 가격 패턴
 HAN = dict(zip("일이삼사오육칠팔구", range(1, 10)))
 D = "[1-9일이삼사오육칠팔구]"
 P_KEYWORD = re.compile(r"(?:가격|판매가|금액|희망가)\s*[:：]?\s*(\d{1,2},\d{3}|\d{3,4})(?![\d,])")
@@ -77,7 +95,6 @@ def kd(c):
 
 
 def text_price(text):
-    """제목/본문에서 진짜 가격 찾기"""
     text = text or ""
     rules = [(P_KEYWORD, lambda s: int(s.replace(",", "")) * 10_000),
              (P_WON, lambda s: int(s.replace(",", ""))),
@@ -110,20 +127,33 @@ def resolve_price(listed, text, allow_scale):
     return None, "가격 미확인"
 
 
-def extract_year(text):
-    for rx in YEAR_PATTERNS:
+def to_year(s):
+    y = int(s)
+    if len(s) == 4:
+        return y
+    return 1900 + y if y >= 90 else 2000 + y
+
+
+def find_year(text, patterns):
+    best = None
+    for rx in patterns:
         m = rx.search(text or "")
-        if m:
-            y = int(m.group(1))
-            return y + 2000 if y < 100 else y
-    return None
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), m.group(1))
+    return to_year(best[1]) if best else None
+
+
+def extract_year(title, content):
+    return find_year(title, STRONG_YEAR) or find_year(title, TITLE_YEAR) or find_year(content, STRONG_YEAR)
 
 
 def evaluate(l: Listing):
     text = f"{l.title}\n{l.content}"
     if WANTED_RE.search(l.content[:150]):
         return None
-    year = extract_year(l.title) or extract_year(l.content)
+    year = extract_year(l.title, l.content)
+    if year is None and not NOTIFY_UNKNOWN_YEAR:
+        return None
     if year and not (YEAR_MIN <= year <= YEAR_MAX):
         return None
     bike = bool(BIKE_SIGNAL_RE.search(text))
@@ -214,6 +244,7 @@ def links_with_pattern(soup, platform, base, pattern):
 
 
 def page_detail(f, l: Listing):
+    """매물 본문만 가져오기 (다른 추천 매물 글이 섞이지 않게 페이지 전체 텍스트는 쓰지 않음)"""
     soup = BeautifulSoup(f.html(l.url), "lxml")
     desc, price = "", None
     for d in ld_products(soup):
@@ -222,14 +253,16 @@ def page_detail(f, l: Listing):
     nd = soup.find("script", id="__NEXT_DATA__")
     if not desc and nd and nd.string:
         try:
-            cands = [v for d in walk(json.loads(nd.string)) for k, v in d.items()
-                     if k in ("productDescription", "description", "content") and isinstance(v, str)]
-            desc = max(cands, key=len) if cands else ""
+            for d in walk(json.loads(nd.string)):
+                v = d.get("productDescription")
+                if isinstance(v, str) and v:
+                    desc = v
+                    break
         except json.JSONDecodeError:
             pass
     if not desc:
         og = soup.find("meta", property="og:description")
-        desc = og.get("content", "") if og else soup.get_text(" ", strip=True)[:3000]
+        desc = og.get("content", "") if og else ""
     l.content = desc[:5000]
     if l.price is None:
         l.price = price
@@ -288,7 +321,6 @@ def daangn_search(f, kw):
 
 
 def site_search(f, name, tpl, kw):
-    """라이트바겐·파쏘처럼 주소만 알면 되는 사이트용 범용 검색"""
     if not tpl:
         return None
     url = tpl.replace("{kw}", quote(kw))
