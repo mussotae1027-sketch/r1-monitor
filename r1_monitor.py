@@ -2,6 +2,7 @@
 """야마하 R1 (2015~2019년식) 매물 감시 → 디스코드 알림 (GitHub Actions에서 10분마다 1회 실행)
 - 가격은 사이트 등록가 그대로 표시
 - 새 매물/가격 인하가 있을 때 '전체 목록'을 보내고, 신규는 🆕 · 가격 인하는 🔻 표시
+- 당근마켓 외 플랫폼은 PRICE_MIN ~ BUDGET_B 범위 안의 매물만 표시
 """
 import json
 import os
@@ -20,7 +21,9 @@ from bs4 import BeautifulSoup
 KEYWORDS = ["야마하 R1", "YZF-R1"]
 YEAR_MIN, YEAR_MAX = 2015, 2019
 BUDGET_A = 10_000_000            # 🔥 표시 기준 (1,000만)
-BUDGET_B = 15_000_000            # 최대 예산 (등록가가 정상 범위인데 이걸 넘으면 제외)
+BUDGET_B = 15_000_000            # 최대 예산 (1,500만)
+PRICE_MIN = 7_000_000            # 최소 가격 (700만) - 이보다 싸거나 가격 없는 매물은 제외
+PRICE_EXEMPT = ["당근마켓"]       # 여기 적힌 플랫폼은 최소 가격 적용 안 함 (1,500만 초과만 제외)
 NOTIFY_UNKNOWN_YEAR = False      # True: 연식 안 적힌 매물도 '연식 미확인'으로 표시
 SKIP_RESERVED = True             # True: 예약중 매물도 제외 / False: 예약중은 표시
 PASSO_ENABLED = True             # False: 파쏘 감시 끄기
@@ -30,6 +33,7 @@ LIGHTWAGEN_SEARCH_URL = "https://www.reitwagen.co.kr/products/home/used?u=models
 
 REAL_MIN, REAL_MAX = 5_000_000, 30_000_000      # '정상 등록가'로 보는 범위
 SEEN_FILE = "seen.json"
+SEEN_VER = 3                                    # 조건이 바뀌면 숫자를 올려서 기존 매물 다시 검사
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 KST = timezone(timedelta(hours=9))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -116,6 +120,13 @@ def plausible(p):
     return bool(p) and REAL_MIN <= p <= REAL_MAX
 
 
+def price_ok(l: "Listing") -> bool:
+    """가격 조건: 당근마켓 등 예외 플랫폼은 1,500만 초과만 제외 / 나머지는 700만~1,500만만 통과"""
+    if l.platform in PRICE_EXEMPT:
+        return not (plausible(l.price) and l.price > BUDGET_B)
+    return bool(l.price) and PRICE_MIN <= l.price <= BUDGET_B
+
+
 def card_price(text):
     """목록 카드 글자에서 표시된 가격 그대로 읽기"""
     m = P_MAN.search(text or "")
@@ -169,7 +180,7 @@ def evaluate(l: Listing):
         return None
     if year and not (YEAR_MIN <= year <= YEAR_MAX):
         return None
-    if plausible(l.price) and l.price > BUDGET_B:
+    if not price_ok(l):
         return None
     return {"year": year}
 
@@ -596,12 +607,12 @@ def main():
                     continue
 
                 old = seen.get(l.uid)
-                v2 = bool(old and old.get("v") == 2)
+                cur_ver = bool(old and old.get("v") == SEEN_VER)
 
                 # ① 이미 확인한 매물이고 가격 그대로면 → 저장된 결과 재사용 (페이지 다시 안 열음)
-                if old and old.get("p") == l.price and (v2 or not old.get("m")):
+                if old and old.get("p") == l.price and (cur_ver or not old.get("m")):
                     old["at"] = today
-                    if v2 and old.get("m"):
+                    if cur_ver and old.get("m"):
                         info = {"price": old.get("price"), "year": old.get("y"), "title": old.get("t")}
                         current.append((l, info, "" if old.get("n") else "new"))
                         shown += 1
@@ -618,7 +629,7 @@ def main():
                     nap()
                 if l.page_price:
                     l.price = l.page_price      # 매물 페이지의 공식 등록가 우선
-                entry = {"v": 2, "p": listed, "price": l.price, "m": False, "y": None,
+                entry = {"v": SEEN_VER, "p": listed, "price": l.price, "m": False, "y": None,
                          "t": l.title[:80], "n": False, "at": today}
                 if l.sold or not R1_RE.search(l.title) or is_parts(l):
                     sold += int(l.sold)
@@ -628,14 +639,14 @@ def main():
                 if res:
                     entry.update(m=True, y=res["year"])
                     info = {"price": l.price, "year": res["year"], "title": l.title}
-                    if v2 and old.get("m"):                      # 알던 매물인데 가격이 바뀜
+                    if cur_ver and old.get("m"):                 # 알던 매물인데 가격이 바뀜
                         entry["n"] = old.get("n", False)
                         if old.get("price") and l.price and l.price < old["price"]:
                             tag = "drop"
                             info["note"] = f"가격 변경 {won(old['price'])} → {won(l.price)}"
                         else:
                             tag = "" if entry["n"] else "new"
-                    elif old and not v2 and old.get("m"):        # 예전 버전에서 이미 알림 갔던 매물
+                    elif old and not cur_ver and old.get("m"):   # 예전 버전에서 이미 알림 갔던 매물
                         entry["n"] = True
                         tag = ""
                     else:
