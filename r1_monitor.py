@@ -2,6 +2,7 @@
 """야마하 R1 (2015~2019년식) 매물 감시 → 디스코드 알림 (GitHub Actions에서 10분마다 1회 실행)
 - 가격은 사이트 등록가 그대로 표시
 - 새 매물/가격 인하가 있을 때 '전체 목록'을 보내고, 신규는 🆕 · 가격 인하는 🔻 표시
+- 매일 아침 DAILY_HOUR:DAILY_MINUTE 이후 첫 자동 실행 때는 조건에 맞는 매물 전체를 보냄 (하루 1회)
 - 당근마켓 외 플랫폼은 PRICE_MIN ~ BUDGET_B 범위 안의 매물만 표시
 """
 import json
@@ -26,6 +27,8 @@ PRICE_MIN = 7_000_000            # 최소 가격 (700만) - 이보다 싸거나 
 PRICE_EXEMPT = ["당근마켓"]       # 여기 적힌 플랫폼은 최소 가격 적용 안 함 (1,500만 초과만 제외)
 NOTIFY_UNKNOWN_YEAR = False      # True: 연식 안 적힌 매물도 '연식 미확인'으로 표시
 SKIP_RESERVED = True             # True: 예약중 매물도 제외 / False: 예약중은 표시
+DAILY_REPORT = True              # True: 매일 아침 전체 목록 알림 / False: 끄기
+DAILY_HOUR, DAILY_MINUTE = 9, 30 # 이 시각(한국시간) 이후 첫 자동 실행 때 전체 목록 전송
 PASSO_ENABLED = True             # False: 파쏘 감시 끄기
 PASSO_LIST_URL = "http://bike.passo.co.kr/bike/"
 LIGHTWAGEN_SEARCH_URL = "https://www.reitwagen.co.kr/products/home/used?u=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&s=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&b=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&p=models%255B0%255D%3DYZF%2520R1%26modelIds%255B0%255D%3D10895%26brands%255B0%255D%3D%25EC%2595%25BC%25EB%25A7%2588%25ED%2595%2598%26brandIds%255B0%255D%3D5&e=keyword%255B0%255D%3DYZF%2520R1"
@@ -34,6 +37,7 @@ LIGHTWAGEN_SEARCH_URL = "https://www.reitwagen.co.kr/products/home/used?u=models
 REAL_MIN, REAL_MAX = 5_000_000, 30_000_000      # '정상 등록가'로 보는 범위
 SEEN_FILE = "seen.json"
 SEEN_VER = 3                                    # 조건이 바뀌면 숫자를 올려서 기존 매물 다시 검사
+DAILY_KEY = "_daily"                            # seen.json 안에 아침 알림 보낸 날짜 기록용
 WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 KST = timezone(timedelta(hours=9))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -513,7 +517,7 @@ def format_item(l, info, tag):
     return "\n".join(lines)
 
 
-def send_list(items):
+def send_list(items, daily=False):
     """현재 조건에 맞는 매물 전체를 보냄. 🆕/🔻 먼저, 그다음 가격순"""
     def sort_key(x):
         _, info, tag = x
@@ -533,7 +537,7 @@ def send_list(items):
     if cur:
         chunks.append(cur)
 
-    head = f"🏍️ R1 매물 현황 {len(items)}건"
+    head = ("☀️ 아침 정기 알림 · " if daily else "🏍️ ") + f"R1 매물 현황 {len(items)}건"
     extra = [s for s in (f"🆕 신규 {n_new}건" if n_new else "", f"🔻 가격인하 {n_drop}건" if n_drop else "") if s]
     if extra:
         head += " (" + ", ".join(extra) + ")"
@@ -563,7 +567,7 @@ def load_seen():
 
 def save_seen(seen):
     cutoff = (datetime.now(KST) - timedelta(days=90)).strftime("%Y-%m-%d")
-    seen = {k: v for k, v in seen.items() if v.get("at", "9999") >= cutoff}
+    seen = {k: v for k, v in seen.items() if isinstance(v, dict) and v.get("at", "9999") >= cutoff}
     with open(SEEN_FILE, "w", encoding="utf-8") as fp:
         json.dump(seen, fp, ensure_ascii=False, indent=0)
 
@@ -573,7 +577,16 @@ def main():
         print("DISCORD_WEBHOOK_URL이 비어 있어요. Settings > Secrets에 등록했는지 확인하세요.")
         sys.exit(1)
     manual = os.getenv("RUN_MODE") == "workflow_dispatch"
-    seen, today, report, current = load_seen(), datetime.now(KST).strftime("%Y-%m-%d"), [], []
+    now = datetime.now(KST)
+    seen, today, report, current = load_seen(), now.strftime("%Y-%m-%d"), [], []
+
+    # 아침 정기 알림: 오늘 DAILY 시각 이후 첫 자동 실행이면 전체 목록 전송
+    daily_done = (seen.get(DAILY_KEY) or {}).get("at") == today
+    daily = (DAILY_REPORT and not manual and not daily_done
+             and (now.hour, now.minute) >= (DAILY_HOUR, DAILY_MINUTE))
+    if daily:
+        print("☀️ 아침 정기 알림 실행")
+
     f = Fetcher()
     try:
         for name, search, detail in PLATFORMS:
@@ -662,13 +675,20 @@ def main():
                           + (f"\n   오류: {err}" if err and not found else ""))
 
         has_event = any(tag in ("new", "drop") for _, _, tag in current)
-        if current and (has_event or manual):
-            if send_list(current):
+        if current and (has_event or manual or daily):
+            if send_list(current, daily=daily):
                 for l, _, _ in current:
                     if l.uid in seen:
                         seen[l.uid]["n"] = True      # 보낸 매물은 다음부터 🆕 없이 표시
-        elif manual:
-            discord({"content": "🏍️ 현재 조건에 맞는 R1 매물이 없어요."})
+                if daily:
+                    seen[DAILY_KEY] = {"at": today}  # 오늘 아침 알림 완료 기록
+        elif manual or daily:
+            try:
+                msg = ("☀️ 아침 정기 알림 · " if daily else "🏍️ ") + "현재 조건에 맞는 R1 매물이 없어요."
+                if discord({"content": msg}) and daily:
+                    seen[DAILY_KEY] = {"at": today}
+            except Exception as e:
+                print("디스코드 발송 실패:", e)
     finally:
         f.close()
         save_seen(seen)
